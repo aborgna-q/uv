@@ -14,7 +14,7 @@ use uv_client::{BaseClientBuilder, Connectivity, FlatIndexClient, RegistryClient
 use uv_configuration::{Concurrency, ExtrasSpecification, Reinstall, Upgrade};
 use uv_dispatch::BuildDispatch;
 use uv_distribution::DistributionDatabase;
-use uv_fs::Simplified;
+use uv_fs::{Simplified, CWD};
 use uv_installer::{SatisfiesResult, SitePackages};
 use uv_normalize::PackageName;
 use uv_python::{
@@ -27,7 +27,7 @@ use uv_resolver::{
 };
 use uv_types::{BuildIsolation, EmptyInstalledPackages, HashStrategy};
 use uv_warnings::{warn_user, warn_user_once};
-use uv_workspace::Workspace;
+use uv_workspace::{DiscoveryOptions, VirtualProject, Workspace, WorkspaceError};
 
 use crate::commands::pip::loggers::{InstallLogger, ResolveLogger};
 use crate::commands::pip::operations::{Changelog, Modifications};
@@ -35,6 +35,8 @@ use crate::commands::reporters::{PythonDownloadReporter, ResolverReporter};
 use crate::commands::{pip, SharedState};
 use crate::printer::Printer;
 use crate::settings::{InstallerSettingsRef, ResolverInstallerSettings, ResolverSettingsRef};
+
+use super::python::pin::pep440_version_from_request;
 
 pub(crate) mod add;
 pub(crate) mod environment;
@@ -1046,4 +1048,76 @@ fn warn_on_requirements_txt_setting(
     if !no_build.is_none() && settings.build_options.no_build() != no_build {
         warn_user_once!("Ignoring `--no-binary` setting from requirements file. Instead, use the `--no-build` command-line argument, or set `no-build` in a `uv.toml` or `pyproject.toml` file.");
     }
+}
+
+/// Determine the [`PythonRequest`] to use in a command, if any.
+pub(crate) async fn find_python_request(
+    user_request: Option<String>,
+    no_project: bool,
+    no_config: bool,
+) -> Result<Option<PythonRequest>, ProjectError> {
+    // (1) Explicit request from user
+    let mut request = user_request.map(|request| PythonRequest::parse(&request));
+
+    let (project, requires_python) = if no_project {
+        (None, None)
+    } else {
+        let project = match VirtualProject::discover(&CWD, &DiscoveryOptions::default()).await {
+            Ok(project) => Some(project),
+            Err(WorkspaceError::MissingProject(_)) => None,
+            Err(WorkspaceError::MissingPyprojectToml) => None,
+            Err(WorkspaceError::NonWorkspace(_)) => None,
+            Err(err) => {
+                warn_user_once!("{err}");
+                None
+            }
+        };
+
+        let requires_python = if let Some(project) = project.as_ref() {
+            find_requires_python(project.workspace())?
+        } else {
+            None
+        };
+
+        (project, requires_python)
+    };
+
+    // (2) Request from a `.python-version` file
+    if request.is_none() {
+        let version_file = PythonVersionFile::discover(&*CWD, no_config).await?;
+
+        let mut should_use = true;
+        if let Some(request) = version_file.as_ref().and_then(PythonVersionFile::version) {
+            // If we're in a project, make sure the request is compatible
+            if let Some(requires_python) = &requires_python {
+                if let Some(version) = pep440_version_from_request(request) {
+                    if !requires_python.specifiers().contains(&version) {
+                        let path = version_file.as_ref().unwrap().path();
+                        if path.starts_with(project.unwrap().root()) {
+                            // It's the pin is declared _inside_ the project, just warn...
+                            warn_user_once!("The pinned Python version ({version}) in `{}` does not meet the project's Python requirement of `{requires_python}`.", path.user_display().cyan());
+                        } else {
+                            // Otherwise, we can just ignore the pin — it's outside the project
+                            debug!("Ignoring pinned Python version ({version}) at `{}`, it does not meet the project's Python requirement of `{requires_python}`.", path.user_display().cyan());
+                            should_use = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if should_use {
+            request = version_file.and_then(PythonVersionFile::into_version);
+        }
+    }
+
+    // (3) The `requires-python` defined in `pyproject.toml`
+    if request.is_none() && !no_project {
+        request = requires_python
+            .as_ref()
+            .map(RequiresPython::specifiers)
+            .map(|specifiers| PythonRequest::Version(VersionRequest::Range(specifiers.clone())));
+    }
+
+    Ok(request)
 }
